@@ -1,0 +1,45 @@
+From 683b267890b94db2ffac621d767a8ea5c9f43d66 Mon Sep 17 00:00:00 2001
+From: Paul Scheduikat <luantak@pm.me>
+Date: Thu, 3 Sep 2026 08:57:04 +0000
+Subject: [PATCH 1/4] add custom magic value
+
+Allow Garble to replace the pclntab magic value when it rebuilds the linker, so the runtime metadata written by the linker uses the per-build value expected by Garble.
+---
+ cmd/link/internal/ld/pcln.go | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/cmd/link/internal/ld/pcln.go b/cmd/link/internal/ld/pcln.go
+index 08c4d4db83..ffe8fdf7a1 100644
+--- a/cmd/link/internal/ld/pcln.go
++++ b/cmd/link/internal/ld/pcln.go
+@@ -4,6 +4,10 @@
+ 
+ package ld
+ 
++import (
++	"os"
++)
++
+ import (
+ 	"cmd/internal/goobj"
+ 	"cmd/internal/objabi"
+@@ -282,6 +286,19 @@ func (state *pclntab) generatePCHeader(ctxt *Link) {
+ 		if off != size {
+ 			panic(fmt.Sprintf("pcHeader size: %d != %d", off, size))
+ 		}
++
++		// Use garble prefix in variable names to minimize collision risk
++		garbleMagicStr := os.Getenv("GARBLE_LINK_MAGIC")
++		if garbleMagicStr == "" {
++			panic("[garble] magic value must be set")
++		}
++		var garbleMagicVal uint32
++		// Use fmt package instead of strconv to avoid importing a new package
++		if _, err := fmt.Sscan(garbleMagicStr, &garbleMagicVal); err != nil {
++			panic(fmt.Errorf("[garble] invalid magic value %s: %v", garbleMagicStr, err))
++		}
++
++		header.SetUint32(ctxt.Arch, 0, garbleMagicVal)
+ 	}
+ 
+ 	state.pcheader = state.addGeneratedSym(ctxt, "runtime.pcheader", size, int32(ctxt.Arch.PtrSize), writeHeader)

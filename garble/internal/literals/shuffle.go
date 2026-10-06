@@ -1,0 +1,86 @@
+// Copyright (c) 2020, The Garble Authors.
+// See LICENSE for licensing information.
+
+package literals
+
+import (
+	"go/ast"
+	"go/token"
+	mathrand "math/rand"
+
+	ah "mvdan.cc/garble/internal/asthelper"
+)
+
+type shuffle struct{}
+
+// check that the obfuscator interface is implemented
+var _ obfuscator = shuffle{}
+
+func (shuffle) obfuscate(rand *mathrand.Rand, names *generatedNames, data []byte, extKeys []*externalKey) *ast.BlockStmt {
+	key := make([]byte, len(data))
+	rand.Read(key)
+
+	const (
+		minIdxKeySize = 2
+		maxIdxKeySize = 16
+	)
+
+	idxKeySize := minIdxKeySize
+	if tmp := rand.Intn(len(data)); tmp > idxKeySize {
+		idxKeySize = tmp
+	}
+	if idxKeySize > maxIdxKeySize {
+		idxKeySize = maxIdxKeySize
+	}
+
+	idxKey := make([]byte, idxKeySize)
+	rand.Read(idxKey)
+
+	fullData := make([]byte, len(data)+len(key))
+	operators := make([]token.Token, len(fullData))
+	for i := range operators {
+		operators[i] = randOperator(rand)
+	}
+
+	for i, b := range key {
+		fullData[i], fullData[i+len(data)] = evalOperator(operators[i], data[i], b), b
+	}
+
+	shuffledIdxs := rand.Perm(len(fullData))
+
+	shuffledFullData := make([]byte, len(fullData))
+	for i, b := range fullData {
+		shuffledFullData[shuffledIdxs[i]] = b
+	}
+
+	args := []ast.Expr{names.ident("data")}
+	for i := range data {
+		keyIdx := rand.Intn(idxKeySize)
+		k := int(idxKey[keyIdx])
+
+		args = append(args, operatorToReversedBinaryExpr(
+			operators[i],
+			ah.IndexExpr(names.name("fullData"), &ast.BinaryExpr{X: ah.IntLit(shuffledIdxs[i] ^ k), Op: token.XOR, Y: ah.CallExprByName("int", ah.IndexExpr(names.name("idxKey"), ah.IntLit(keyIdx)))}),
+			ah.IndexExpr(names.name("fullData"), &ast.BinaryExpr{X: ah.IntLit(shuffledIdxs[len(data)+i] ^ k), Op: token.XOR, Y: ah.CallExprByName("int", ah.IndexExpr(names.name("idxKey"), ah.IntLit(keyIdx)))}),
+		))
+	}
+
+	return ah.BlockStmt(
+		&ast.AssignStmt{
+			Lhs: []ast.Expr{names.ident("fullData")},
+			Tok: token.DEFINE,
+			Rhs: []ast.Expr{dataToByteSliceWithExtKeys(rand, names, shuffledFullData, extKeys)},
+		},
+		&ast.AssignStmt{
+			Lhs: []ast.Expr{names.ident("idxKey")},
+			Tok: token.DEFINE,
+			Rhs: []ast.Expr{dataToByteSliceWithExtKeys(rand, names, idxKey, extKeys)},
+		},
+		makeDataStmt(names, len(data)),
+		&ast.AssignStmt{
+			Lhs: []ast.Expr{names.ident("data")},
+			Tok: token.ASSIGN,
+			Rhs: []ast.Expr{ah.CallExpr(ast.NewIdent("append"), args...)},
+		},
+	)
+}

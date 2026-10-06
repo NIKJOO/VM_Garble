@@ -1,0 +1,407 @@
+// Copyright (c) 2020, The Garble Authors.
+// See LICENSE for licensing information.
+
+package main
+
+import (
+	"go/ast"
+	"go/token"
+	"go/types"
+	"slices"
+	"strconv"
+	"strings"
+
+	ah "mvdan.cc/garble/internal/asthelper"
+)
+
+// updateMagicValue updates the global constant
+// `Go120PCLnTabMagic PCLnTabMagic = 0xfffffff1`
+// to use the provided magic value integer.
+// This is the latest magic value in use as of Go 1.27.
+func updateMagicValue(file *ast.File, magicValue uint32) {
+	magicUpdated := false
+
+	for _, decl := range file.Decls {
+		decl, ok := decl.(*ast.GenDecl)
+		if !ok || decl.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range decl.Specs {
+			spec, ok := spec.(*ast.ValueSpec)
+			if !ok || len(spec.Names) != 1 || len(spec.Values) != 1 {
+				continue
+			}
+			if spec.Names[0].Name == "Go120PCLnTabMagic" {
+				spec.Values[0] = &ast.BasicLit{
+					Kind:  token.INT,
+					Value: strconv.FormatUint(uint64(magicValue), 10),
+				}
+				magicUpdated = true
+			}
+		}
+	}
+
+	if !magicUpdated {
+		panic("magic value not updated")
+	}
+}
+
+// cloneIdent copies an identifier and carries its type object to the new AST
+// node, allowing the identifier obfuscator to treat both uses consistently.
+func cloneIdent(node *ast.Ident, info *types.Info) *ast.Ident {
+	clone := &ast.Ident{NamePos: node.NamePos, Name: node.Name, Obj: node.Obj}
+	if info != nil {
+		if obj := info.ObjectOf(node); obj != nil {
+			info.Uses[clone] = obj
+		}
+	}
+	return clone
+}
+
+// updateEntryOffset adds xor encryption for funcInfo.entryoff
+// Encryption algorithm contains 1 xor and 1 multiply operations and is not cryptographically strong.
+// Its goal, without slowing down program performance (reflection, stacktrace),
+// is to make it difficult to determine relations between function metadata and function itself in a binary file.
+// Difficulty of decryption is based on the difficulty of finding a small (probably inlined) entry() function without obvious patterns.
+//
+// The info parameter is used to register new AST nodes with type information,
+// which is necessary for the obfuscator to process them correctly when runtime
+// obfuscation is enabled.
+func updateEntryOffset(file *ast.File, entryOffKey uint32, info *types.Info) {
+	// Note that this field could be renamed in future Go versions.
+	const nameOffField = "nameOff"
+	entryOffUpdated := false
+
+	// During linker stage we encrypt funcInfo.entryoff using a random number and funcInfo.nameOff,
+	// for correct program functioning we must decrypt funcInfo.entryoff at any access to it.
+	// In runtime package all references to funcInfo.entryOff are made through one method entry():
+	// func (f funcInfo) entry() uintptr {
+	//	return f.datap.textAddr(f.entryoff)
+	// }
+	// It is enough to inject decryption into entry() method for program to start working transparently with encrypted value of funcInfo.entryOff:
+	// func (f funcInfo) entry() uintptr {
+	//	return f.datap.textAddr(f.entryoff ^ (uint32(f.nameOff) * <random int>))
+	// }
+	updateEntryOff := func(node ast.Node) bool {
+		callExpr, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+
+		textSelExpr, ok := callExpr.Fun.(*ast.SelectorExpr)
+		if !ok || textSelExpr.Sel.Name != "textAddr" {
+			return true
+		}
+
+		selExpr, ok := callExpr.Args[0].(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+
+		// Get the receiver identifier (e.g., "f" in "f.entryOff")
+		receiverIdent, ok := selExpr.X.(*ast.Ident)
+		if !ok {
+			return true
+		}
+
+		// Clone the receiver identifier for the new selector expression.
+		// This is crucial: we must NOT share the same ast.Ident node between
+		// multiple parent nodes, as that confuses the obfuscator which walks
+		// the AST and modifies node.Name in place.
+		clonedReceiver := cloneIdent(receiverIdent, info)
+
+		// Find the nameOff field in the struct to get its type object
+		// so we can properly register the new selector in the type info.
+		// We use LookupFieldOrMethod because nameOff might be in an embedded struct.
+		var nameOffVar *types.Var
+		if info != nil {
+			if obj := info.ObjectOf(receiverIdent); obj != nil {
+				// LookupFieldOrMethod handles embedded fields correctly.
+				// For unexported fields like nameOff, we need to pass the package.
+				pkg := obj.Pkg()
+				fieldObj, _, _ := types.LookupFieldOrMethod(obj.Type(), true, pkg, nameOffField)
+				if fv, ok := fieldObj.(*types.Var); ok {
+					nameOffVar = fv
+				}
+			}
+		}
+
+		// Create the new nameOff selector: clonedReceiver.nameOff
+		nameOffIdent := ast.NewIdent(nameOffField)
+		if info != nil && nameOffVar != nil {
+			info.Uses[nameOffIdent] = nameOffVar
+		}
+
+		newSelector := &ast.SelectorExpr{
+			X:   clonedReceiver,
+			Sel: nameOffIdent,
+		}
+
+		callExpr.Args[0] = &ast.BinaryExpr{
+			X:  selExpr,
+			Op: token.XOR,
+			Y: &ast.ParenExpr{X: &ast.BinaryExpr{
+				X:  ah.CallExpr(ast.NewIdent("uint32"), newSelector),
+				Op: token.MUL,
+				Y: &ast.BasicLit{
+					Kind:  token.INT,
+					Value: strconv.FormatUint(uint64(entryOffKey), 10),
+				},
+			}},
+		}
+		entryOffUpdated = true
+		return false
+	}
+
+	var entryFunc *ast.FuncDecl
+	for _, decl := range file.Decls {
+		decl, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if decl.Name.Name == "entry" {
+			entryFunc = decl
+			break
+		}
+	}
+	if entryFunc == nil {
+		panic("entry function not found")
+	}
+
+	ast.Inspect(entryFunc, updateEntryOff)
+	if !entryOffUpdated {
+		panic("entryOff not found")
+	}
+}
+
+func stripFatalStringFragments(expr ast.Expr) {
+	switch expr := expr.(type) {
+	case *ast.BasicLit:
+		if expr.Kind == token.STRING {
+			expr.Value = `""`
+		}
+	case *ast.ParenExpr:
+		stripFatalStringFragments(expr.X)
+	case *ast.BinaryExpr:
+		if expr.Op == token.ADD {
+			stripFatalStringFragments(expr.X)
+			stripFatalStringFragments(expr.Y)
+		}
+	}
+}
+
+// runtimeFatalCalls lists, per package, the diagnostic functions whose string
+// arguments are blanked in tiny mode. In the standard library these are
+// linknamed to [runtime.throw]/runtime.fatal (or, for exithook, populated with
+// [runtime.throw] at init), so garble's runtime-only cleanup would otherwise
+// leave their messages in the binary; cgroup also prints one such message
+// through the print builtins. The names are kept exact because in these
+// packages every such call is a crash diagnostic whose message is throwaway.
+var runtimeFatalCalls = map[string][]string{
+	"runtime":                   {"throw", "fatal"},
+	"crypto/internal/fips140":   {"fatal"},
+	"crypto/internal/sysrand":   {"fatal"},
+	"crypto/rand":               {"fatal"},
+	"internal/runtime/cgroup":   {"throw", "print", "println"},
+	"internal/runtime/exithook": {"Throw"},
+	"internal/runtime/maps":     {"fatal"},
+	"internal/sync":             {"throw", "fatal"},
+	"sync":                      {"throw", "fatal"},
+}
+
+// stripFatalMessages blanks the static string fragments passed to the diagnostic
+// functions named for importPath. Non-literal arguments keep being evaluated, so
+// their local uses and side effects are preserved; only the embedded text is
+// removed, and tiny mode already suppresses the runtime's fatal output.
+func stripFatalMessages(importPath string, file *ast.File) {
+	callNames := runtimeFatalCalls[importPath]
+	if callNames == nil {
+		return
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok || !slices.Contains(callNames, id.Name) {
+			return true
+		}
+		for _, arg := range call.Args {
+			stripFatalStringFragments(arg)
+		}
+		return true
+	})
+}
+
+// stripRuntime removes unnecessary code from the runtime,
+// such as panic and fatal error printing, and code that
+// prints trace/debug info of the runtime.
+//
+// strippedVMAName is a named result so callers can tell it apart from a
+// general success/failure flag: it is set only when setVMAName was emptied.
+func stripRuntime(basename string, file *ast.File) (strippedFunctions map[string]bool, strippedVMAName bool) {
+	strippedFunctions = make(map[string]bool)
+	emptyBody := func(funcDecl *ast.FuncDecl) {
+		funcDecl.Body.List = nil
+		strippedFunctions[funcDecl.Name.Name] = true
+	}
+
+	stripPrints := func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok {
+			return true
+		}
+
+		switch id.Name {
+		case "print", "println":
+			id.Name = "hidePrint"
+			return false
+		default:
+			return true
+		}
+	}
+
+	for _, decl := range file.Decls {
+		funcDecl, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+
+		switch basename {
+		case "error.go":
+			// only used in panics
+			switch funcDecl.Name.Name {
+			case "printany", "printanycustomtype":
+				funcDecl.Body.List = nil
+			}
+		case "debuglog.go":
+			// printDebugLog is called directly from fatal panic and signal
+			// paths. Its implementation can also write through gwrite, so the
+			// generic print/println rewrite below is not sufficient.
+			if funcDecl.Name.Name == "printDebugLog" {
+				emptyBody(funcDecl)
+			}
+		case "hexdump.go":
+			// Go 1.26 moved hexdumpWords out of print.go. It is only used for
+			// fatal GC, signal, and traceback diagnostics in production builds.
+			if funcDecl.Name.Name == "hexdumpWords" {
+				emptyBody(funcDecl)
+			}
+		case "mgcscavenge.go":
+			// used in tracing the scavenger
+			if funcDecl.Name.Name == "printScavTrace" {
+				funcDecl.Body.List = nil
+			}
+		case "mprof.go":
+			// remove all functions that print debug/tracing info
+			// of the runtime
+			if strings.HasPrefix(funcDecl.Name.Name, "trace") {
+				funcDecl.Body.List = nil
+			}
+		case "panic.go":
+			// used for printing panics
+			switch funcDecl.Name.Name {
+			case "preprintpanics", "printpanics":
+				funcDecl.Body.List = nil
+			}
+		case "print.go":
+			// only used in tracebacks
+			if funcDecl.Name.Name == "hexdumpWords" {
+				funcDecl.Body.List = nil
+			}
+		case "proc.go":
+			// used in tracing the scheduler
+			if funcDecl.Name.Name == "schedtrace" {
+				funcDecl.Body.List = nil
+			}
+		case "runtime1.go":
+			// setTraceback is deliberately left alone. Besides selecting how
+			// much of a traceback is printed, it decides whether fatal errors
+			// crash the process rather than exiting with status 2, and it
+			// enables Windows Error Reporting for GOTRACEBACK=wer.
+		case "runtime.go":
+			// writeErrStr bypasses the print builtins and writes fixed fatal
+			// diagnostics straight to stderr (and SetCrashOutput). Tiny mode
+			// already suppresses those same diagnostics through the ordinary
+			// runtime print paths, so suppress this bypass as well. Do not
+			// empty writeErrData or gwrite: application print/println relies on
+			// those lower-level writers.
+			if funcDecl.Name.Name == "writeErrStr" {
+				emptyBody(funcDecl)
+			}
+		case "set_vma_name_linux.go":
+			// Linux exposes anonymous VMA names through /proc/PID/maps. They are
+			// diagnostic-only labels such as "Go: heap arena", not correctness
+			// metadata, and would otherwise remain as an OS-visible runtime trace.
+			if funcDecl.Name.Name == "setVMAName" {
+				emptyBody(funcDecl)
+				strippedVMAName = true
+			}
+		case "traceback.go":
+			// only used for printing tracebacks
+			switch funcDecl.Name.Name {
+			case "tracebackdefers", "printcreatedby", "printcreatedby1", "traceback", "tracebacktrap", "traceback1", "printAncestorTraceback",
+				"printAncestorTracebackFuncInfo", "goroutineheader", "tracebackothers", "tracebackHexdump", "printCgoTraceback":
+				funcDecl.Body.List = nil
+			case "printOneCgoTraceback":
+				funcDecl.Body = ah.BlockStmt(ah.ReturnStmt(ast.NewIdent("false")))
+			default:
+				if strings.HasPrefix(funcDecl.Name.Name, "print") {
+					funcDecl.Body.List = nil
+				}
+			}
+		}
+
+	}
+
+	if basename == "print.go" {
+		file.Decls = append(file.Decls, hidePrintDecl)
+		return strippedFunctions, strippedVMAName
+	}
+
+	// replace all 'print' and 'println' statements in
+	// the runtime with an empty func, which will be
+	// optimized out by the compiler
+	ast.Inspect(file, stripPrints)
+	return strippedFunctions, strippedVMAName
+}
+
+var requiredDirectRuntimeStrips = map[string][]string{
+	"debuglog.go": {"printDebugLog"},
+	"hexdump.go":  {"hexdumpWords"},
+	"runtime.go":  {"writeErrStr"},
+}
+
+func validateDirectRuntimeStripping(strippedByFile map[string]map[string]bool) {
+	for basename, names := range requiredDirectRuntimeStrips {
+		for _, name := range names {
+			if !strippedByFile[basename][name] {
+				panic("runtime stripping rule did not match " + basename + ":" + name)
+			}
+		}
+	}
+}
+
+var hidePrintDecl = &ast.FuncDecl{
+	Doc: &ast.CommentGroup{
+		List: []*ast.Comment{
+			{Text: "//go:nowritebarrierrec"},
+			{Text: "//go:nosplit"},
+		},
+	},
+	Name: ast.NewIdent("hidePrint"),
+	Type: &ast.FuncType{Params: &ast.FieldList{
+		List: []*ast.Field{{
+			Names: []*ast.Ident{{Name: "args"}},
+			Type: &ast.Ellipsis{Elt: &ast.InterfaceType{
+				Methods: &ast.FieldList{},
+			}},
+		}},
+	}},
+	Body: &ast.BlockStmt{},
+}

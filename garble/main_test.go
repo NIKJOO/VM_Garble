@@ -1,0 +1,687 @@
+// Copyright (c) 2019, The Garble Authors.
+// See LICENSE for licensing information.
+
+package main
+
+import (
+	"flag"
+	"fmt"
+	"go/ast"
+	"go/printer"
+	"go/token"
+	"io/fs"
+	mathrand "math/rand"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-quicktest/qt"
+	"github.com/rogpeppe/go-internal/goproxytest"
+	"github.com/rogpeppe/go-internal/gotooltest"
+	"github.com/rogpeppe/go-internal/testscript"
+
+	ah "mvdan.cc/garble/internal/asthelper"
+	"mvdan.cc/garble/internal/literals"
+)
+
+var proxyURL string
+
+func TestMain(m *testing.M) {
+	// If GORACE is unset, lower the default of atexit_sleep_ms=1000,
+	// since otherwise every execution of garble through the test binary
+	// would sleep for one second before exiting.
+	// Given how many times garble runs via toolexec, that is very slow!
+	// If GORACE is set, we assume that the caller knows what they are doing,
+	// and we don't try to replace or modify their flags.
+	if os.Getenv("GORACE") == "" {
+		os.Setenv("GORACE", "atexit_sleep_ms=10")
+	}
+	if os.Getenv("RUN_GARBLE_MAIN") == "true" {
+		main()
+		return
+	}
+	testscript.Main(garbleMain{m}, map[string]func(){
+		"garble": main,
+	})
+}
+
+type garbleMain struct {
+	m *testing.M
+}
+
+func (m garbleMain) Run() int {
+	// Start the Go proxy server running for all tests.
+	srv, err := goproxytest.NewServer("testdata/mod", "")
+	if err != nil {
+		panic(fmt.Sprintf("cannot start proxy: %v", err))
+	}
+	proxyURL = srv.URL
+
+	return m.m.Run()
+}
+
+var update = flag.Bool("u", false, "update testscript output files")
+
+func TestScript(t *testing.T) {
+	t.Parallel()
+
+	execPath, err := os.Executable()
+	qt.Assert(t, qt.IsNil(err))
+
+	tempCacheDir := t.TempDir()
+
+	hostCacheDir, err := os.UserCacheDir()
+	qt.Assert(t, qt.IsNil(err))
+
+	p := testscript.Params{
+		Dir: filepath.Join("testdata", "script"),
+		Setup: func(env *testscript.Env) error {
+			// Use testdata/mod as our module proxy.
+			env.Setenv("GOPROXY", proxyURL)
+
+			// gotoolchain.txtar is one test which wants to reuse GOMODCACHE.
+			out, err := exec.Command("go", "env", "GOMODCACHE").Output()
+			if err != nil {
+				return err
+			}
+			env.Setenv("HOST_GOMODCACHE", strings.TrimSpace(string(out)))
+
+			// We use our own GOPROXY above, so avoid using sum.golang.org,
+			// as we would fail to update any go.sum file in the testscripts.
+			env.Setenv("GONOSUMDB", "*")
+
+			// "go build" starts many short-lived Go processes,
+			// such as asm, buildid, compile, and link.
+			// They don't allocate huge amounts of memory,
+			// and they'll exit within seconds,
+			// so using the GC is basically a waste of CPU.
+			// Turn it off entirely, releasing memory on exit.
+			//
+			// We don't want this setting always on,
+			// as it could result in memory problems for users.
+			// But it helps for our test suite,
+			// as the packages are relatively small.
+			env.Setenv("GOGC", "off")
+
+			env.Setenv("gofullversion", runtime.Version())
+			env.Setenv("EXEC_PATH", execPath)
+
+			if os.Getenv("GOCOVERDIR") != "" {
+				// Don't share cache dirs with the host if we want to collect code
+				// coverage. Otherwise, the coverage info might be incomplete.
+				env.Setenv("GOCACHE", filepath.Join(tempCacheDir, "go-cache"))
+				env.Setenv("GARBLE_CACHE", filepath.Join(tempCacheDir, "garble-cache"))
+			} else {
+				// GOCACHE is initialized by gotooltest to use the host's cache.
+				env.Setenv("GARBLE_CACHE", filepath.Join(hostCacheDir, "garble"))
+			}
+			return nil
+		},
+		// TODO: this condition should probably be supported by gotooltest
+		Condition: func(cond string) (bool, error) {
+			switch cond {
+			case "qemu-riscv64":
+				_, err := exec.LookPath("qemu-riscv64")
+				return err == nil, nil
+			case "cgo":
+				out, err := exec.Command("go", "env", "CGO_ENABLED").Output()
+				if err != nil {
+					return false, err
+				}
+				result := strings.TrimSpace(string(out))
+				switch result {
+				case "0", "1":
+					return result == "1", nil
+				default:
+					return false, fmt.Errorf("unknown CGO_ENABLED: %q", result)
+				}
+			}
+			return false, fmt.Errorf("unknown condition")
+		},
+		Cmds: map[string]func(ts *testscript.TestScript, neg bool, args []string){
+			"sleep":             sleep,
+			"binsubstr":         binsubstr,
+			"bincmp":            bincmp,
+			"generate-literals": generateLiterals,
+			"setenvfile":        setenvfile,
+			"grepfiles":         grepfiles,
+			"setup-go":          setupGo,
+		},
+		UpdateScripts:       *update,
+		RequireExplicitExec: true,
+		RequireUniqueNames:  true,
+	}
+	if err := gotooltest.Setup(&p); err != nil {
+		t.Fatal(err)
+	}
+	testscript.Run(t, p)
+}
+
+func createFile(ts *testscript.TestScript, path string) *os.File {
+	file, err := os.Create(ts.MkAbs(path))
+	if err != nil {
+		ts.Fatalf("%v", err)
+	}
+	return file
+}
+
+// sleep is akin to a shell's sleep builtin.
+// Note that tests should almost never use this; it's currently only used to
+// work around a low-level Go syscall race on Linux.
+func sleep(ts *testscript.TestScript, neg bool, args []string) {
+	if len(args) != 1 {
+		ts.Fatalf("usage: sleep duration")
+	}
+	d, err := time.ParseDuration(args[0])
+	if err != nil {
+		ts.Fatalf("%v", err)
+	}
+	time.Sleep(d)
+}
+
+func binsubstr(ts *testscript.TestScript, neg bool, args []string) {
+	if len(args) < 2 {
+		ts.Fatalf("usage: binsubstr file substr...")
+	}
+	data := ts.ReadFile(args[0])
+	var failed []string
+	for _, substr := range args[1:] {
+		match := strings.Contains(data, substr)
+		if match && neg {
+			failed = append(failed, substr)
+		} else if !match && !neg {
+			failed = append(failed, substr)
+		}
+	}
+	if len(failed) > 0 && neg {
+		ts.Fatalf("unexpected match for %q in %s", failed, args[0])
+	} else if len(failed) > 0 {
+		ts.Fatalf("expected match for %q in %s", failed, args[0])
+	}
+}
+
+func bincmp(ts *testscript.TestScript, neg bool, args []string) {
+	if len(args) != 2 {
+		ts.Fatalf("usage: bincmp file1 file2")
+	}
+	for _, arg := range args {
+		switch arg {
+		case "stdout", "stderr":
+			ts.Fatalf("bincmp is for binary files. did you mean cmp?")
+		}
+	}
+	data1 := ts.ReadFile(args[0])
+	data2 := ts.ReadFile(args[1])
+	if neg {
+		if data1 == data2 {
+			ts.Fatalf("%s and %s don't differ", args[0], args[1])
+		}
+		return
+	}
+	if data1 != data2 {
+		outDir := "bincmp_output"
+		err := os.MkdirAll(outDir, 0o777)
+		ts.Check(err)
+
+		file1, err := os.CreateTemp(outDir, "file1-*")
+		ts.Check(err)
+		_, err = file1.Write([]byte(data1))
+		ts.Check(err)
+		err = file1.Close()
+		ts.Check(err)
+
+		file2, err := os.CreateTemp(outDir, "file2-*")
+		ts.Check(err)
+		_, err = file2.Write([]byte(data2))
+		ts.Check(err)
+		err = file2.Close()
+		ts.Check(err)
+
+		ts.Logf("wrote files to %s and %s; try inspecting with diffoscope",
+			file1.Name(), file2.Name())
+		sizeDiff := len(data2) - len(data1)
+		ts.Fatalf("%s and %s differ; size diff: %+d",
+			args[0], args[1], sizeDiff)
+	}
+}
+
+// Ensure deterministic randomness between test runs.
+var testRand = mathrand.New(mathrand.NewSource(12345678))
+
+const uniqueLitString = "garble_unique_string"
+
+// generateLiterals creates a source file with random string literals appended
+// to a global var in init, preventing the compiler from optimizing them away.
+func generateLiterals(ts *testscript.TestScript, neg bool, args []string) {
+	if neg {
+		ts.Fatalf("unsupported: ! generate-literals")
+	}
+	if len(args) != 1 {
+		ts.Fatalf("usage: generate-literals file")
+	}
+
+	codePath := args[0]
+
+	// Global string variable to which which we append string literals: `var x = ""`
+	globalVar := &ast.GenDecl{
+		Tok: token.VAR,
+		Specs: []ast.Spec{
+			&ast.ValueSpec{
+				Names: []*ast.Ident{ast.NewIdent("x")},
+				Values: []ast.Expr{
+					&ast.BasicLit{Kind: token.STRING, Value: `""`},
+				},
+			},
+		},
+	}
+
+	var statements []ast.Stmt
+
+	// 100 literals up to MaxSize, all containing uniqueLitString.
+	for range 100 {
+		randSize := testRand.Intn(literals.MaxSize - len(uniqueLitString) + 1)
+		buffer := make([]byte, randSize)
+		testRand.Read(buffer)
+		statements = append(
+			statements,
+			&ast.AssignStmt{
+				Lhs: []ast.Expr{ast.NewIdent("x")},
+				Tok: token.ADD_ASSIGN,
+				Rhs: []ast.Expr{ah.StringLit(string(buffer) + uniqueLitString)},
+			},
+		)
+	}
+
+	// 5 huge literals past MaxSize, without uniqueLitString; not obfuscated.
+	for range 5 {
+		size := literals.MaxSize + 1 + testRand.Intn(128<<10)
+		buffer := make([]byte, size)
+		testRand.Read(buffer)
+		statements = append(
+			statements,
+			&ast.AssignStmt{
+				Lhs: []ast.Expr{ast.NewIdent("x")},
+				Tok: token.ADD_ASSIGN,
+				Rhs: []ast.Expr{ah.StringLit(string(buffer))},
+			},
+		)
+	}
+
+	// An `init` function which includes all assignments from above
+	initFunc := &ast.FuncDecl{
+		Name: &ast.Ident{
+			Name: "init",
+		},
+		Type: &ast.FuncType{},
+		Body: ah.BlockStmt(statements...),
+	}
+
+	// A file with the global string variable and init function
+	file := &ast.File{
+		Name: ast.NewIdent("main"),
+		Decls: []ast.Decl{
+			globalVar,
+			initFunc,
+		},
+	}
+
+	codeFile := createFile(ts, codePath)
+	defer codeFile.Close()
+
+	if err := printer.Fprint(codeFile, token.NewFileSet(), file); err != nil {
+		ts.Fatalf("%v", err)
+	}
+}
+
+func setenvfile(ts *testscript.TestScript, neg bool, args []string) {
+	if neg {
+		ts.Fatalf("unsupported: ! setenvfile")
+	}
+	if len(args) != 2 {
+		ts.Fatalf("usage: setenvfile name file")
+	}
+
+	ts.Setenv(args[0], ts.ReadFile(args[1]))
+}
+
+func grepfiles(ts *testscript.TestScript, neg bool, args []string) {
+	if len(args) != 2 {
+		ts.Fatalf("usage: grepfiles path pattern")
+	}
+	anyFound := false
+	path, pattern := ts.MkAbs(args[0]), args[1]
+	rx := regexp.MustCompile(pattern)
+	if err := filepath.WalkDir(path, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if rx.MatchString(path) {
+			if neg {
+				return fmt.Errorf("%q matches %q", path, pattern)
+			} else {
+				anyFound = true
+				return fs.SkipAll
+			}
+		}
+		return nil
+	}); err != nil {
+		ts.Fatalf("%s", err)
+	}
+	if !neg && !anyFound {
+		ts.Fatalf("no matches for %q", pattern)
+	}
+}
+
+func setupGo(ts *testscript.TestScript, neg bool, args []string) {
+	if neg || len(args) != 1 {
+		ts.Fatalf("usage: setup-go version")
+	}
+	// Download the version of Go specified as an argument, cache it in GOMODCACHE,
+	// and get its GOROOT directory inside the cache so we can use it.
+	cmd := exec.Command("go", "env", "GOROOT")
+	cmd.Env = append(cmd.Environ(), "GOTOOLCHAIN="+args[0])
+	out, err := cmd.Output()
+	ts.Check(err)
+
+	goroot := strings.TrimSpace(string(out))
+
+	ts.Setenv("PATH", filepath.Join(goroot, "bin")+string(os.PathListSeparator)+ts.Getenv("PATH"))
+	// Remove GOROOT from the environment, as it is unnecessary and gets in the way
+	// when we want to test GOTOOLCHAIN upgrades, which will need different GOROOTs.
+	ts.Setenv("GOROOT", "")
+}
+
+func TestSplitFlagsFromArgs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		args []string
+		want [2][]string
+	}{
+		{"Empty", []string{}, [2][]string{{}, nil}},
+		{
+			"JustFlags",
+			[]string{"-foo", "bar", "-baz"},
+			[2][]string{{"-foo", "bar", "-baz"}, nil},
+		},
+		{
+			"JustArgs",
+			[]string{"some", "pkgs"},
+			[2][]string{{}, {"some", "pkgs"}},
+		},
+		{
+			"FlagsAndArgs",
+			[]string{"-foo=bar", "baz"},
+			[2][]string{{"-foo=bar"}, {"baz"}},
+		},
+		{
+			"BoolFlagsAndArgs",
+			[]string{"-race", "pkg"},
+			[2][]string{{"-race"}, {"pkg"}},
+		},
+		{
+			"PrefixedBoolFlagsAndArgs",
+			[]string{"-test.v", "pkg"},
+			[2][]string{{"-test.v"}, {"pkg"}},
+		},
+		{
+			"SeparatorAfterFlag",
+			[]string{"-trimpath", "--", "pkg"},
+			[2][]string{{"-trimpath", "--"}, {"pkg"}},
+		},
+		{
+			"SeparatorFirst",
+			[]string{"--", "pkg"},
+			[2][]string{{"--"}, {"pkg"}},
+		},
+		{
+			"LongBoolFlagsAndArgs",
+			[]string{"--trimpath", "pkg"},
+			[2][]string{{"--trimpath"}, {"pkg"}},
+		},
+		{
+			"LongExplicitBoolFlag",
+			[]string{"--race=false", "pkg"},
+			[2][]string{{"--race=false"}, {"pkg"}},
+		},
+		{
+			"LongValueFlag",
+			[]string{"--tags", "tag", "pkg"},
+			[2][]string{{"--tags", "tag"}, {"pkg"}},
+		},
+		{
+			"ExplicitBoolFlag",
+			[]string{"-race=true", "pkg"},
+			[2][]string{{"-race=true"}, {"pkg"}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			flags, args := splitFlagsFromArgs(test.args)
+			got := [2][]string{flags, args}
+
+			qt.Assert(t, qt.DeepEquals(got, test.want))
+		})
+	}
+}
+
+func TestTestBooleanFlags(t *testing.T) {
+	for _, name := range []string{"artifacts", "benchmem", "failfast", "fullpath", "short", "v"} {
+		for _, prefix := range []string{"-", "-test.", "--test."} {
+			arg := prefix + name
+			flags, args := splitFlagsFromArgs([]string{arg, "pkg"})
+			qt.Assert(t, qt.DeepEquals(flags, []string{arg}))
+			qt.Assert(t, qt.DeepEquals(args, []string{"pkg"}))
+			forwarded, _ := filterForwardBuildFlags([]string{arg, "-tags", "tag"})
+			qt.Assert(t, qt.DeepEquals(forwarded, []string{"-tags", "tag"}))
+		}
+	}
+}
+
+func TestFilterForwardBuildFlags(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		flags []string
+		want  []string
+	}{
+		{"Empty", []string{}, nil},
+		{
+			"NoBuild",
+			[]string{"-short", "-json"},
+			nil,
+		},
+		{
+			"Mixed",
+			[]string{"-short", "-tags", "foo", "-mod=readonly", "-json"},
+			[]string{"-tags", "foo", "-mod=readonly"},
+		},
+		{
+			"NonBinarySkipped",
+			[]string{"-o", "binary", "-tags", "foo"},
+			[]string{"-tags", "foo"},
+		},
+		{
+			"UnknownTestBooleanThenBuildFlag",
+			[]string{"-custom", "-tags=special", "-count=1"},
+			[]string{"-tags=special"},
+		},
+		{
+			"UnknownTestValueThenBuildFlag",
+			[]string{"-custom", "value", "-tags", "special"},
+			[]string{"-tags", "special"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, _ := filterForwardBuildFlags(test.flags)
+			qt.Assert(t, qt.DeepEquals(got, test.want))
+		})
+	}
+}
+
+func TestFlagValue(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		flags    []string
+		flagName string
+		want     string
+	}{
+		{"StrSpace", []string{"-buildid", "bar"}, "-buildid", "bar"},
+		{"StrSpaceDash", []string{"-buildid", "-bar"}, "-buildid", "-bar"},
+		{"StrEqual", []string{"-buildid=bar"}, "-buildid", "bar"},
+		{"StrEqualDash", []string{"-buildid=-bar"}, "-buildid", "-bar"},
+		{"StrMissing", []string{"-foo"}, "-buildid", ""},
+		{"StrNotFollowed", []string{"-buildid"}, "-buildid", ""},
+		{"StrEmpty", []string{"-buildid="}, "-buildid", ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got := flagValue(test.flags, test.flagName)
+			qt.Assert(t, qt.DeepEquals(got, test.want))
+		})
+	}
+}
+
+func TestRuntimeFuncIDBuiltinSymbols(t *testing.T) {
+	for _, name := range []string{
+		"abort", "asmcgocall", "asyncPreempt", "cgocallback", "corostart",
+		"debugCallV2", "deferreturn", "gcBgMarkWorker", "goexit", "gogo",
+		"gopanic", "handleAsyncEvent", "main", "mcall", "morestack", "mstart",
+		"panicwrap", "rt0_go", "runCleanups", "runFinalizers", "sigpanic",
+		"systemstack", "systemstack_switch",
+	} {
+		if !slices.Contains(builtinSymbols["runtime"], name) {
+			t.Errorf("runtime.%s must be included in the assembler symbol map", name)
+		}
+	}
+}
+
+func TestRuntimeGoexitToolchainDependency(t *testing.T) {
+	if !isToolchainNameDependency("runtime", "goexit") {
+		t.Fatal("runtime.goexit must keep its assembly name for runtime stack metadata")
+	}
+	if !slices.Contains(builtinSymbols["runtime"], "goexit") {
+		t.Fatal("runtime.goexit must be included in the linker symbol map")
+	}
+}
+
+func TestRuntimeAddmoduledataBuiltinSymbol(t *testing.T) {
+	if !slices.Contains(builtinSymbols["runtime"], "addmoduledata") {
+		t.Fatal("runtime.addmoduledata must be included in the linker symbol map")
+	}
+}
+
+func TestRuntimeModuledataBuiltinSymbol(t *testing.T) {
+	for _, name := range []string{"moduledata", "modulehash"} {
+		if !slices.Contains(builtinSymbols["runtime"], name) {
+			t.Errorf("runtime.%s must be included in the linker symbol map", name)
+		}
+	}
+}
+
+func TestRuntimeAsmcgocallLandingpadBuiltinSymbol(t *testing.T) {
+	if !slices.Contains(builtinSymbols["runtime"], "asmcgocall_landingpad") {
+		t.Fatal("runtime.asmcgocall_landingpad must be included in the assembler symbol map")
+	}
+}
+
+func TestRuntimeBuiltinSymbolsExcludeNonSymbolLiterals(t *testing.T) {
+	for _, name := range []string{"elf_", "go", "retpoline", "test"} {
+		if slices.Contains(builtinSymbols["runtime"], name) {
+			t.Errorf("runtime.%s is not a complete symbol name", name)
+		}
+	}
+}
+
+func TestFuzzCoverageBoundarySymbols(t *testing.T) {
+	for _, name := range []string{"_counters", "_ecounters"} {
+		if !slices.Contains(builtinSymbols["internal/fuzz"], name) {
+			t.Errorf("internal/fuzz.%s must be included in the linker symbol map", name)
+		}
+	}
+}
+
+func TestRuntimeGeneratedLinkerSymbols(t *testing.T) {
+	for _, name := range []string{"buildVersion", "modinfo", "unreachableMethod"} {
+		if !slices.Contains(builtinSymbols["runtime"], name) {
+			t.Errorf("runtime.%s must be included in the linker symbol map", name)
+		}
+	}
+}
+
+func TestStructsHostLayoutToolchainDependency(t *testing.T) {
+	if !isToolchainNameDependency("structs", "HostLayout") {
+		t.Fatal("structs.HostLayout must keep its name for go:wasmimport validation")
+	}
+}
+
+func TestReplaceGoAsmNamesPreservesOtherIdentifiers(t *testing.T) {
+	nameMap := map[string]string{
+		"asm__size": "obfuscated__size",
+		"wasm_pc":   "obfuscated_pc",
+	}
+	input := "#include \"garbled_asm_ppc64x.h\"\nMOVD $asm__size, R3\nCall wasm_pc_f_loop(SB)\nMOVD $wasm_pc, R4\n"
+	want := "#include \"garbled_asm_ppc64x.h\"\nMOVD $obfuscated__size, R3\nCall wasm_pc_f_loop(SB)\nMOVD $obfuscated_pc, R4\n"
+	if got := replaceGoAsmNames(input, nameMap); got != want {
+		t.Fatalf("replaceGoAsmNames() = %q, want %q", got, want)
+	}
+}
+
+func TestVMFlattenEnv(t *testing.T) {
+	tests := []struct {
+		value   string
+		flatten bool
+		decoys  bool
+	}{
+		// Flattening is part of virtualization, so an unset or unrecognised
+		// value leaves it on without the extra decoy edges.
+		{"", true, false},
+		{"1", true, false},
+		{"on", true, false},
+		{"yes", true, false},
+		{"garbage", true, false},
+		// Explicit opt-outs, including the ones a script is most likely to use.
+		{"0", false, false},
+		{"off", false, false},
+		{"false", false, false},
+		{"no", false, false},
+		{" OFF ", false, false},
+		// The expensive mode.
+		{"decoys", true, true},
+		{"full", true, true},
+		{"2", true, true},
+		{"Decoys", true, true},
+	}
+	for _, tc := range tests {
+		flatten, decoys := vmFlattenEnv(tc.value)
+		if flatten != tc.flatten || decoys != tc.decoys {
+			t.Errorf("vmFlattenEnv(%q) = (%v, %v), want (%v, %v)", tc.value, flatten, decoys, tc.flatten, tc.decoys)
+		}
+	}
+}
+
+func TestReverseContentPreservesRuntimeFrames(t *testing.T) {
+	const input = "runtime.main()\n	runtime/proc.go:1 +0x1\nruntime.goexit()\n	runtime/asm_amd64.s:1 +0x1\n"
+	var out strings.Builder
+	modified, err := reverseContent(&out, strings.NewReader(input), strings.NewReplacer(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modified {
+		t.Fatal("reverseContent reported a modification without a matching replacement")
+	}
+	if got := out.String(); got != input {
+		t.Fatalf("reverseContent removed runtime frames:\n%s", got)
+	}
+}

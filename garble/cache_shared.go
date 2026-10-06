@@ -1,0 +1,703 @@
+// Copyright (c) 2020, The Garble Authors.
+// See LICENSE for licensing information.
+
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"maps"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/tinylib/msgp/msgp"
+)
+
+//go:generate go run scripts/gen_go_std_tables.go
+
+// msgp generates the MessagePack marshalers in cache_shared_gen.go. -unexported
+// is needed since our types are unexported; `msg:"-"` skips a field.
+//go:generate go tool msgp -file=$GOFILE -o=cache_shared_gen.go -io=false -tests=false -unexported
+
+// listedPackages is ignored as it has hand-written marshalers for its lazy index.
+//msgp:ignore listedPackages
+
+// sharedCacheType is shared as a read-only cache between the many garble toolexec
+// sub-processes.
+//
+// Note that we fill this cache once from the root process in saveListedPackages,
+// store it into a temporary file via msgp encoding, and then reuse that file
+// in each of the garble toolexec sub-processes.
+type sharedCacheType struct {
+	ForwardBuildFlags []string // build flags fed to the original "garble ..." command
+
+	CacheDir string // absolute path to the GARBLE_CACHE directory being used
+
+	// ListedPackages contains data obtained via 'go list -json -export -deps'.
+	// This allows us to obtain the non-obfuscated export data of all dependencies,
+	// useful for type checking of the packages as we obfuscate them.
+	ListedPackages *listedPackages
+
+	// We can't use garble's own module version, as it may not exist.
+	// We can't use the stamped VCS information either,
+	// as uncommitted changes simply show up as "dirty".
+	//
+	// The only unique way to identify garble's version without being published
+	// or committed is to use its content ID from the build cache.
+	BinaryContentID []byte
+
+	// GoCmd is [GoEnv.GOROOT]/bin/go, so that we run exactly the same version
+	// of the Go tool that the original "go build" invocation did.
+	GoCmd string
+
+	// Filled directly from "go env".
+	// Keep in sync with fetchGoEnv.
+	GoEnv struct {
+		GOOS   string // the GOOS build target
+		GOARCH string // the GOARCH build target
+
+		GOVERSION string
+		GOROOT    string
+	}
+}
+
+var sharedCache *sharedCacheType
+
+// listedPackages holds the listedPackage entries obtained via 'go list'.
+//
+// The root process fills it eagerly. Each toolexec sub-process only needs a few
+// packages, so the serialized blob is an index of byte offsets plus concatenated
+// per-package payloads, decoded lazily on first access; decode cost then scales
+// with the packages a sub-process touches, not the whole graph.
+//
+// The payloads use msgp rather than gob: a fresh gob.Decoder compiles a decoding
+// engine per call, which lazy per-entry decoding would pay once per package.
+type listedPackages struct {
+	// entries holds decoded packages. In the root process it holds every
+	// package; in a sub-process it is populated lazily by get, and also holds
+	// any packages added dynamically via appendListedPackages.
+	entries map[string]*listedPackage
+
+	// index and data back the lazy decoding in sub-processes. index maps an
+	// import path to the byte range of its payload within data. Both are nil
+	// in the root process, where entries already holds everything.
+	index map[string]pkgRange
+	data  []byte
+}
+
+// pkgRange locates a single package's payload within the packages data blob.
+type pkgRange struct {
+	Offset, Length uint64
+}
+
+// listedPackagesData is the serialized index of listedPackages: each import
+// path to the byte range of its payload. The concatenated payloads follow the
+// index in the blob; see [listedPackages.MarshalMsg].
+type listedPackagesData struct {
+	Index map[string]pkgRange
+}
+
+func newListedPackages() *listedPackages {
+	return &listedPackages{entries: make(map[string]*listedPackage)}
+}
+
+// get returns the listed package for an import path, decoding it from the
+// lazy blob on first access. The boolean reports whether the package is known,
+// mirroring a map lookup.
+func (l *listedPackages) get(path string) (*listedPackage, bool) {
+	if pkg, ok := l.entries[path]; ok {
+		return pkg, true
+	}
+	r, ok := l.index[path]
+	if !ok {
+		return nil, false
+	}
+	pkg := new(listedPackage)
+	if _, err := pkg.UnmarshalMsg(l.data[r.Offset : r.Offset+r.Length]); err != nil {
+		panic(fmt.Sprintf("cannot decode listed package %q: %v", path, err))
+	}
+	l.entries[path] = pkg
+	return pkg, true
+}
+
+// has reports whether a package is known without decoding it.
+func (l *listedPackages) has(path string) bool {
+	if _, ok := l.entries[path]; ok {
+		return true
+	}
+	_, ok := l.index[path]
+	return ok
+}
+
+// set records a package, used while filling the cache via 'go list'.
+func (l *listedPackages) set(path string, pkg *listedPackage) {
+	l.entries[path] = pkg
+}
+
+// all decodes every package and returns the full map. It is only used by cold
+// paths such as -debugdir and 'garble reverse', so forcing a full decode is fine.
+func (l *listedPackages) all() map[string]*listedPackage {
+	for path := range l.index {
+		l.get(path)
+	}
+	return l.entries
+}
+
+// MarshalMsg implements msgp.Marshaler, encoding the byte-range index followed
+// by the concatenated per-package payloads. The payloads are appended as a raw
+// bytes value so UnmarshalMsg can alias them rather than copying.
+func (l *listedPackages) MarshalMsg(b []byte) ([]byte, error) {
+	blob := listedPackagesData{Index: make(map[string]pkgRange, len(l.entries))}
+	var data []byte
+	for path, pkg := range l.entries {
+		start := len(data)
+		var err error
+		if data, err = pkg.MarshalMsg(data); err != nil {
+			return nil, err
+		}
+		blob.Index[path] = pkgRange{uint64(start), uint64(len(data) - start)}
+	}
+	b, err := blob.MarshalMsg(b)
+	if err != nil {
+		return nil, err
+	}
+	return msgp.AppendBytes(b, data), nil
+}
+
+// UnmarshalMsg implements msgp.Unmarshaler, loading the index and payload bytes;
+// individual packages are decoded lazily by get.
+func (l *listedPackages) UnmarshalMsg(b []byte) ([]byte, error) {
+	var blob listedPackagesData
+	o, err := blob.UnmarshalMsg(b)
+	if err != nil {
+		return o, err
+	}
+	l.index = blob.Index
+	// ReadBytesZC aliases the input rather than copying, so l.data points into
+	// the caller's buffer; loadSharedCache passes a fresh os.ReadFile buffer that
+	// lives as long as l.data. Do not pool or mutate that buffer.
+	l.data, o, err = msgp.ReadBytesZC(o)
+	if err != nil {
+		return o, err
+	}
+	l.entries = make(map[string]*listedPackage)
+	return o, nil
+}
+
+// Msgsize estimates the encoded size, used by msgp to preallocate. It need not
+// be exact, as the buffer grows on demand.
+func (l *listedPackages) Msgsize() int {
+	rangeSize := pkgRange{}.Msgsize()
+	s := msgp.MapHeaderSize + msgp.BytesPrefixSize
+	for path, pkg := range l.entries {
+		s += msgp.StringPrefixSize + len(path) + rangeSize + pkg.Msgsize()
+	}
+	return s
+}
+
+// sharedCacheFilename is the msgp-encoded cache file in the GARBLE_SHARED dir.
+const sharedCacheFilename = "main-cache.bin"
+
+// loadSharedCache the shared data passed from the entry garble process
+func loadSharedCache() error {
+	if sharedCache != nil {
+		panic("shared cache loaded twice?")
+	}
+	startTime := time.Now()
+	path := filepath.Join(sharedTempDir, sharedCacheFilename)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf(`cannot open shared file: %v\ndid you run "go [command] -toolexec=garble" instead of "garble [command]"?`, err)
+	}
+	defer func() {
+		log.Printf("shared cache loaded in %s from %s", debugSince(startTime), path)
+	}()
+	sharedCache = new(sharedCacheType)
+	if _, err := sharedCache.UnmarshalMsg(data); err != nil {
+		return fmt.Errorf("cannot decode shared file: %v", err)
+	}
+	return nil
+}
+
+// saveSharedCache writes the msgp-encoded cache global into sharedTempDir,
+// the temporary directory shared between garble processes.
+func saveSharedCache() error {
+	if sharedCache == nil {
+		panic("saving a missing cache?")
+	}
+	data, err := sharedCache.MarshalMsg(nil)
+	if err != nil {
+		return err
+	}
+	return writeFileExclusive(filepath.Join(sharedTempDir, sharedCacheFilename), data)
+}
+
+func createExclusive(name string) (*os.File, error) {
+	return os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
+}
+
+func writeFileExclusive(name string, data []byte) error {
+	f, err := createExclusive(name)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err2 := f.Close(); err == nil {
+		err = err2
+	}
+	return err
+}
+
+// listedPackage contains the 'go list -json -export' fields obtained by the
+// root process, shared with all garble sub-processes via a file.
+type listedPackage struct {
+	Name       string
+	ImportPath string
+	ForTest    string
+	Export     string
+	BuildID    string
+	ImportMap  map[string]string
+	Standard   bool
+
+	Dir             string
+	CompiledGoFiles []string // all .go files to build
+	SFiles          []string // all .s (asm) files to build
+	Imports         []string
+
+	Error *packageError // to report package loading errors to the user
+
+	// The fields below are not part of 'go list', but are still reused
+	// between garble processes. Use "Garble" as a prefix to ensure no
+	// collisions with the JSON fields from 'go list'.
+
+	// allDeps is like the Deps field given by 'go list', but in the form of a map
+	// for the sake of fast lookups. It's also unnecessary to consume or store Deps
+	// as returned by 'go list', as it can be reconstructed from Imports.
+	// Not serialized: rebuilt lazily by hasDep.
+	allDeps map[string]struct{} `msg:"-"`
+
+	// GarbleActionID is a hash combining the Action ID from BuildID,
+	// with Garble's own inputs as per addGarbleToHash.
+	// It is set even when toObfuscate is false, as it is also used for random
+	// seeds and build cache paths, and not just to obfuscate names.
+	GarbleActionID [sha256.Size]byte `json:"-"`
+}
+
+// toObfuscate excludes runtime/cgo (which crashes on Windows), FIPS packages
+// (whose special symbols and no-relocation rule prevent obfuscation), and empty
+// packages such as OS-specific packages with no matching files.
+func (p *listedPackage) toObfuscate() bool {
+	path := p.ImportPath
+	if p.ForTest != "" {
+		path = p.ForTest
+	}
+	return path != "runtime/cgo" &&
+		path != "crypto/internal/fips140" &&
+		!strings.HasPrefix(path, "crypto/internal/fips140/") &&
+		len(p.CompiledGoFiles) > 0
+}
+
+func (p *listedPackage) hasDep(path string) bool {
+	if p.allDeps == nil {
+		p.allDeps = make(map[string]struct{}, len(p.Imports)*2)
+		p.addImportsFrom(p)
+	}
+	_, ok := p.allDeps[path]
+	return ok
+}
+
+func (p *listedPackage) addImportsFrom(from *listedPackage) {
+	for _, path := range from.Imports {
+		if path == "C" {
+			// `go list -json` shows "C" in Imports but not Deps.
+			// See https://go.dev/issue/60453.
+			continue
+		}
+		if path2 := from.ImportMap[path]; path2 != "" {
+			path = path2
+		}
+		if _, ok := p.allDeps[path]; ok {
+			continue // already added
+		}
+		p.allDeps[path] = struct{}{}
+		dep, _ := sharedCache.ListedPackages.get(path)
+		p.addImportsFrom(dep)
+	}
+}
+
+type packageError struct {
+	Pos string
+	Err string
+}
+
+// obfuscatedPackageName returns a package's obfuscated package name,
+// which may be unchanged in some cases where we cannot obfuscate it.
+// Note that package main is unchanged as it is treated in a special way by the toolchain.
+// The package name must stay in sync with the import path - if the import path is not
+// obfuscated (e.g., for compiler intrinsics), the name must also be preserved.
+func (p *listedPackage) obfuscatedPackageName() string {
+	if p.Name == "main" || !p.toObfuscate() {
+		return p.Name
+	}
+	// If the import path is not obfuscated, the package name shouldn't be either.
+	// This happens for packages like runtime, reflect, embed, and packages with
+	// compiler intrinsics.
+	if p.obfuscatedImportPath() == p.ImportPath {
+		return p.Name
+	}
+	// The package name itself is obfuscated like any other name.
+	return hashWithPackage(p, p.Name)
+}
+
+// obfuscatedSourceDir returns an obfuscated directory name which can be used
+// to write obfuscated source files to. This directory name should be unique per package,
+// even when building many main packages at once, such as in `go test ./...`.
+func (p *listedPackage) obfuscatedSourceDir() string {
+	return hashWithPackage(p, p.ImportPath)
+}
+
+// obfuscatedImportPath returns a package's obfuscated import path,
+// which may be unchanged in some cases where we cannot obfuscate it.
+// Note that package main always has the unchanged import path "main" as part of a build,
+// but not if it's a main package as part of a test, which can be imported.
+func (p *listedPackage) obfuscatedImportPath() string {
+	if p.Name == "main" && p.ForTest == "" {
+		return "main"
+	}
+	if !p.toObfuscate() {
+		return p.ImportPath
+	}
+	// Keep import paths whose toolchain contracts are not yet translated.
+	// Runtime package paths and intrinsic paths are translated by the patched
+	// compiler and linker through GARBLE_PKGPATH_MAP and GARBLE_SYMBOL_MAP.
+	switch p.ImportPath {
+	case "reflect", "embed",
+		// WASI host imports recognize structs.HostLayout by exact package path.
+		"structs",
+		// These packages are permitted to use special assembly ABIs by path.
+		"syscall",
+		"internal/bytealg",
+		"internal/chacha8rand",
+		"internal/abi",
+		"internal/runtime/syscall/linux",
+		"internal/runtime/syscall/windows",
+		"internal/runtime/startlinetest",
+		// The compiler identifies NotInHeap through this exact package path.
+		"internal/runtime/sys":
+		return p.ImportPath
+	}
+
+	newPath := hashWithPackage(p, p.ImportPath)
+	log.Printf("import path %q hashed with %x to %q", p.ImportPath, p.GarbleActionID, newPath)
+	return newPath
+}
+
+var runtimePkgPathSet = func() map[string]struct{} {
+	set := make(map[string]struct{}, len(runtimePkgPaths))
+	for _, pkgPath := range runtimePkgPaths {
+		set[pkgPath] = struct{}{}
+	}
+	return set
+}()
+
+func isRuntimePkgPath(path string) bool {
+	_, ok := runtimePkgPathSet[path]
+	return ok
+}
+
+// buildRuntimePkgPathMap builds a mapping of obfuscated->original paths for all
+// runtime packages. This is passed to the patched compiler so it can recognize
+// obfuscated runtime packages for special handling (write barriers, etc.)
+// Format: "obfuscated1=original1,obfuscated2=original2,..."
+func buildRuntimePkgPathMap() string {
+	var mappings []string
+	for _, pkgPath := range runtimePkgPaths {
+		lpkg, _ := sharedCache.ListedPackages.get(pkgPath)
+		if lpkg == nil {
+			continue // Package not in current build
+		}
+		obfuscatedPath := lpkg.obfuscatedImportPath()
+		if obfuscatedPath != pkgPath {
+			mappings = append(mappings, obfuscatedPath+"="+pkgPath)
+		}
+	}
+	slices.Sort(mappings)
+	return strings.Join(mappings, ",")
+}
+
+// buildSymbolMap builds a complete mapping of obfuscated->original symbols
+// for all intrinsic and builtin functions. This is passed to the patched
+// compiler and linker so they can recognize obfuscated symbols.
+// Format: "obfuscatedPkg.obfuscatedFunc=originalPkg.originalFunc,..."
+func buildSymbolMap() string {
+	var mappings []string
+	pkgPaths := slices.Sorted(maps.Keys(compilerIntrinsics))
+	for _, pkgPath := range pkgPaths {
+		lpkg, _ := sharedCache.ListedPackages.get(pkgPath)
+		if lpkg == nil || !lpkg.toObfuscate() {
+			continue
+		}
+		obfuscatedPath := lpkg.obfuscatedImportPath()
+		symbols := slices.Sorted(maps.Keys(compilerIntrinsics[pkgPath]))
+		for _, symbol := range symbols {
+			if obfuscatedPath != pkgPath {
+				mappings = append(mappings, obfuscatedPath+"."+symbol+"="+pkgPath+"."+symbol)
+			}
+		}
+	}
+
+	pkgPaths = slices.Sorted(maps.Keys(builtinSymbols))
+	for _, pkgPath := range pkgPaths {
+		lpkg, _ := sharedCache.ListedPackages.get(pkgPath)
+		if lpkg == nil || !lpkg.toObfuscate() {
+			continue
+		}
+		obfuscatedPath := lpkg.obfuscatedImportPath()
+		for _, symbol := range builtinSymbols[pkgPath] {
+			obfuscatedSymbol := obfuscatedPackageObjectName(lpkg, symbol)
+			if obfuscatedPath != pkgPath || obfuscatedSymbol != symbol {
+				mappings = append(mappings, obfuscatedPath+"."+obfuscatedSymbol+"="+pkgPath+"."+symbol)
+			}
+		}
+	}
+	slices.Sort(mappings)
+	return strings.Join(mappings, ",")
+}
+
+// garbleBuildFlags are always passed to top-level build commands such as
+// "go build", "go list", or "go test".
+var garbleBuildFlags = []string{"-trimpath", "-buildvcs=false"}
+
+// linknamedToList returns the runtimeAndLinknamed packages to list on the
+// current GOOS, sorted for determinism. They are reached via runtime linkname
+// rather than imports, so they don't show up in the dependency graph.
+func linknamedToList() []string {
+	linknamed := slices.Sorted(maps.Keys(runtimeAndLinknamed))
+	linknamed = slices.DeleteFunc(linknamed, func(path string) bool {
+		switch {
+		case sharedCache.GoEnv.GOOS != "js" && path == "syscall/js":
+			// GOOS-specific package.
+			return true
+		case sharedCache.GoEnv.GOOS != "darwin" && sharedCache.GoEnv.GOOS != "ios" && path == "crypto/x509/internal/macos":
+			// GOOS-specific package.
+			return true
+		}
+		return false
+	})
+	return linknamed
+}
+
+// appendListedPackages gets information about the current package
+// and all of its dependencies
+func appendListedPackages(packages []string, mainBuild bool) error {
+	startTime := time.Now()
+	args := []string{
+		"list",
+		// Similar flags to what go/packages uses.
+		"-json", "-export", "-compiled", "-e",
+	}
+	// Both the build targets and the extra linknamed packages need their
+	// transitive dependencies. The latter can reach standard packages absent
+	// from the build graph, which compile subprocesses cannot list themselves.
+	args = append(args, "-deps")
+	args = append(args, garbleBuildFlags...)
+	args = append(args, sharedCache.ForwardBuildFlags...)
+
+	if !mainBuild {
+		// If the top-level build included the -mod or -modfile flags,
+		// they should be used when loading the top-level packages.
+		// However, when loading standard library packages,
+		// using those flags would likely result in an error,
+		// as the standard library uses its own Go module and vendoring.
+		args = slices.DeleteFunc(args, func(arg string) bool {
+			return strings.HasPrefix(arg, "-mod=") || strings.HasPrefix(arg, "-modfile=")
+		})
+	}
+
+	// List the build targets alone. Mixing extra standard packages into this
+	// invocation makes go list report PGO dependencies as "path [main]" variants,
+	// even though TOOLEXEC_IMPORTPATH uses the unadorned path. The variants can
+	// also shadow the build IDs of the actual packages being compiled.
+
+	args = append(args, packages...)
+	cmd := exec.Command(sharedCache.GoCmd, args...)
+
+	defer func() {
+		log.Printf("original build info obtained in %s via: go %s", debugSince(startTime), strings.Join(args, " "))
+	}()
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("go list error: %v", err)
+	}
+
+	dec := json.NewDecoder(stdout)
+	var pkgErrors strings.Builder
+	for dec.More() {
+		var pkg listedPackage
+		if err := dec.Decode(&pkg); err != nil {
+			return err
+		}
+
+		if perr := pkg.Error; perr != nil {
+			// Separately listed linknamed packages may fail benignly, like sync_test
+			// being "not in std"; ignore those, but still report errors for the
+			// user's own packages.
+			lenient := !mainBuild || runtimeAndLinknamed[pkg.ImportPath]
+			if lenient && strings.Contains(perr.Err, "build constraints exclude all Go files") {
+				// Some packages in runtimeAndLinknamed need a build tag to be importable,
+				// like crypto/internal/boring/fipstls with boringcrypto,
+				// so any pkg.Error should be ignored when the build tag isn't set.
+			} else if lenient && strings.Contains(perr.Err, "is not in std") {
+				// When we support multiple Go versions at once, some packages may only
+				// exist in the newer version, so we fail to list them with the older.
+			} else {
+				if pkgErrors.Len() > 0 {
+					pkgErrors.WriteString("\n")
+				}
+				if perr.Pos != "" {
+					pkgErrors.WriteString(perr.Pos)
+					pkgErrors.WriteString(": ")
+				}
+				// Error messages sometimes include a trailing newline.
+				pkgErrors.WriteString(strings.TrimRight(perr.Err, "\n"))
+			}
+		}
+
+		// Note that we use the `-e` flag above with `go list`.
+		// If a package fails to load, the Incomplete and Error fields will be set.
+		// We still record failed packages in the ListedPackages map,
+		// because some like crypto/internal/boring/fipstls simply fall under
+		// "build constraints exclude all Go files" and can be ignored.
+		// Real build errors will still be surfaced by `go build -toolexec` later.
+		if sharedCache.ListedPackages.has(pkg.ImportPath) {
+			if !mainBuild {
+				// Keep the original build variant and its build ID.
+				continue
+			}
+			return fmt.Errorf("duplicate package: %q", pkg.ImportPath)
+		}
+		// Note that GarbleActionID is filled by toolexecCmd once the listing
+		// is done, as hashing it needs garble's own content ID.
+
+		sharedCache.ListedPackages.set(pkg.ImportPath, &pkg)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("go list error: %v:\nargs: %q\n%s", err, args, stderr.Bytes())
+	}
+	if pkgErrors.Len() > 0 {
+		return errors.New(pkgErrors.String())
+	}
+
+	if mainBuild {
+		// List only the linknamed packages absent from the build graph, once in
+		// the parent. Keep their -export BuildIDs for stable GarbleActionIDs;
+		// listing them alongside the build targets changes PGO package identity.
+		missing := slices.DeleteFunc(linknamedToList(), sharedCache.ListedPackages.has)
+		if len(missing) > 0 {
+			if err := appendListedPackages(missing, false); err != nil {
+				return fmt.Errorf("failed to load missing runtime-linknamed packages: %v", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+var ErrNotFound = errors.New("not found")
+
+var ErrNotDependency = errors.New("not a dependency")
+
+// implicitLinkerDeps are the packages which the go command adds to main
+// packages on behalf of the linker, depending on the target platform and build
+// flags. They are never in a package's Imports, so any package may refer to
+// them and to their dependencies.
+// Keep in sync with cmd/go/internal/load.LinkerDeps.
+var implicitLinkerDeps = [...]string{
+	"runtime",          // always
+	"runtime/cgo",      // external linking
+	"math",             // GOARCH=arm
+	"runtime/race",     // -race
+	"runtime/msan",     // -msan
+	"runtime/asan",     // -asan
+	"runtime/coverage", // -cover
+}
+
+// listPackage gets the listedPackage information for a certain package
+func listPackage(from *listedPackage, path string) (*listedPackage, error) {
+	if path == from.ImportPath {
+		return from, nil
+	}
+
+	// If the path is listed in the top-level ImportMap, use its mapping instead.
+	// This is a common scenario when dealing with vendored packages in GOROOT.
+	// The map is flat, so we don't need to recurse.
+	if path2 := from.ImportMap[path]; path2 != "" {
+		path = path2
+	}
+
+	pkg, ok := sharedCache.ListedPackages.get(path)
+
+	// A std package may list any other package in std, even those it doesn't depend on.
+	// This is due to how runtime linkname-implements std packages,
+	// such as sync/atomic or reflect, without importing them in any way.
+	// A few other cases don't involve runtime, like time/tzdata linknaming to time,
+	// but luckily those few cases are covered by runtimeAndLinknamed as well,
+	// which appendListedPackages lists separately in the parent process.
+	if from.Standard {
+		if ok {
+			return pkg, nil
+		}
+		return nil, fmt.Errorf("std listed another std package that we can't find: %s", path)
+	}
+
+	// Packages outside std can list any package,
+	// as long as they depend on it directly or indirectly.
+	if ok && from.hasDep(pkg.ImportPath) {
+		return pkg, nil
+	}
+
+	// A test binary "foo.test" depends on the test variants of its packages,
+	// compiled under a "path [foo.test]" key, but refers to some of them by
+	// their bare import path. The bare path may be unknown, or belong to a
+	// non-variant package which the test binary does not depend on. Resolve
+	// to the variant so we use its obfuscated import path.
+	if variant, ok := sharedCache.ListedPackages.get(path + " [" + from.ImportPath + "]"); ok && from.hasDep(variant.ImportPath) {
+		return variant, nil
+	}
+
+	if !ok {
+		return nil, fmt.Errorf("list %s: %w", path, ErrNotFound)
+	}
+
+	// As a special case, any package can list an implicit linker dependency
+	// or one of its dependencies.
+	// We need to handle this ourselves as they do not appear in Imports.
+	for _, implicit := range implicitLinkerDeps {
+		if pkg.ImportPath == implicit {
+			return pkg, nil
+		}
+		// Only runtime is guaranteed to be listed.
+		if implicitPkg, ok := sharedCache.ListedPackages.get(implicit); ok && implicitPkg.hasDep(pkg.ImportPath) {
+			return pkg, nil
+		}
+	}
+
+	return nil, fmt.Errorf("list %s: %w", path, ErrNotDependency)
+}
