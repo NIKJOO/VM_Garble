@@ -1,5 +1,9 @@
 # Garble
 
+
+<a><img src="https://github.com/NIKJOO/VM_Garble/blob/main/Logo/Logo.png" border="0" /></a>
+
+
 **Go symbol and literal obfuscator** with an experimental **stack-based virtualization (VM)** layer for stronger protection against static reverse engineering.
 
 Garble rewrites Go packages at build time: names, literals, and optionally control flow. The VM goes further—selected functions are lowered to a custom bytecode and executed by an embedded interpreter, so the original machine code of those functions never appears in the binary.
